@@ -1,0 +1,715 @@
+---
+title: "Choosing a Classification Method for Measuring Government Criticism in Armenian Civil Society Texts"
+author: "Albert Ananyan"
+date: "2026-03-16"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    geometry: margin=1in
+    fontsize: 12pt
+    linestretch: 1.15
+execute:
+  warning: false
+  message: false
+bibliography: references.bib
+---
+
+```{r}
+library(tidyverse)
+library(reticulate)
+library(knitr)
+library(kableExtra)
+
+opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Data Loading and Preparation
+
+## Load the coded training corpus
+
+Loading the combined training corpus with 642 hand-coded documents from five Armenian watchdog CSOs. Each document is coded for:
+
+- `crit_armenian_human`: 1 if the document criticizes the Armenian government
+- `crit_foreign_human`: 1 if the document criticizes foreign actors
+
+```{r}
+coded_df <- read_csv("data/coded_corpus_combined.csv", show_col_types = FALSE)
+
+cat("Total coded documents:", nrow(coded_df), "\n\n")
+
+org_summary <- coded_df %>%
+  group_by(Organization) %>%
+  summarise(
+    n = n(),
+    critical = sum(crit_armenian_human == 1),
+    non_critical = sum(crit_armenian_human == 0),
+    pct_critical = round(mean(crit_armenian_human) * 100, 1)
+  )
+
+kable(org_summary,
+      caption = "Training data distribution by organization",
+      col.names = c("Organization", "N", "Critical", "Non-critical", "\\% Critical"))
+```
+
+## Visualize class distribution
+
+```{r}
+coded_df %>%
+  mutate(
+    label = ifelse(crit_armenian_human == 1, "Critical", "Non-critical"),
+    label = factor(label, levels = c("Critical", "Non-critical"))
+  ) %>%
+  count(Organization, label) %>%
+  ggplot(aes(x = reorder(Organization, -n), y = n, fill = label)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Critical" = "#E74C3C", "Non-critical" = "#3498DB")) +
+  labs(
+    title = "Training Set Composition by Organization",
+    x = NULL, y = "Number of documents", fill = "Label"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+## Filter foreign-critical documents
+
+Excluding documents that only criticize foreign actors so the classifier specifically captures government-directed criticism.
+
+```{r}
+train_df <- coded_df %>%
+  filter(crit_foreign_human == 0 | crit_armenian_human == 1) %>%
+  transmute(
+    Organization = Organization,
+    text = full_text,
+    label = as.integer(crit_armenian_human)
+  ) %>%
+  drop_na(text, label)
+
+cat("Documents after filtering:", nrow(train_df), "\n")
+cat("Critical:", sum(train_df$label == 1),
+    "| Non-critical:", sum(train_df$label == 0), "\n")
+cat("Class ratio:", round(sum(train_df$label == 1) / sum(train_df$label == 0), 2), ": 1\n")
+```
+
+# Method 1: Naive Bayes on Bag-of-Words
+
+## Preprocessing
+
+```{r}
+library(quanteda)
+library(quanteda.textmodels)
+library(quanteda.textstats)
+
+# custom Armenian stopwords
+armenian_stops <- jsonlite::fromJSON("data/stopwords-hy-clean.json")
+cat("Loaded", length(armenian_stops), "Armenian stopwords\n")
+```
+
+```{r}
+corpus_cso <- corpus(train_df, text_field = "text")
+
+# tokenize and remove stopwords
+toks <- corpus_cso %>%
+  tokens(remove_punct = TRUE,
+         remove_symbols = TRUE,
+         remove_numbers = TRUE) %>%
+  tokens_remove(armenian_stops)
+
+dfm_cso <- dfm(toks)
+cat("Initial features:", nfeat(dfm_cso), "\n")
+
+# trim rare words
+dfm_cso <- dfm_trim(dfm_cso, min_docfreq = 2)
+cat("After trimming:", nfeat(dfm_cso), "features\n")
+```
+
+## Cross-validation
+
+5-fold stratified CV, same folds used across all models.
+
+```{r}
+set.seed(123)
+
+valid_docs <- !is.na(docvars(dfm_cso)$label)
+dfm_valid <- dfm_subset(dfm_cso, valid_docs)
+
+k <- 5
+folds <- sample(rep(1:k, length.out = ndoc(dfm_valid)))
+
+cv_results_nb <- data.frame(fold = 1:k, accuracy = NA, f1 = NA,
+                             precision = NA, recall = NA)
+
+for(i in 1:k) {
+  dfm_cv_train <- dfm_subset(dfm_valid, folds != i)
+  dfm_cv_test <- dfm_subset(dfm_valid, folds == i)
+
+  train_labels <- factor(docvars(dfm_cv_train)$label,
+                         levels = c(0, 1),
+                         labels = c("non_critical", "critical"))
+
+  model_cv <- textmodel_nb(dfm_cv_train, train_labels)
+
+  dfm_cv_test_matched <- dfm_match(dfm_cv_test, features = featnames(dfm_cv_train))
+  pred <- predict(model_cv, newdata = dfm_cv_test_matched)
+  actual <- factor(docvars(dfm_cv_test_matched)$label,
+                   levels = c(0, 1),
+                   labels = c("non_critical", "critical"))
+
+  cv_results_nb$accuracy[i] <- mean(pred == actual, na.rm = TRUE)
+
+  tp <- sum(pred == "critical" & actual == "critical")
+  fp <- sum(pred == "critical" & actual == "non_critical")
+  fn <- sum(pred == "non_critical" & actual == "critical")
+
+  prec <- ifelse(tp + fp > 0, tp / (tp + fp), 0)
+  rec <- ifelse(tp + fn > 0, tp / (tp + fn), 0)
+
+  cv_results_nb$precision[i] <- prec
+  cv_results_nb$recall[i] <- rec
+  cv_results_nb$f1[i] <- ifelse(prec + rec > 0, 2 * prec * rec / (prec + rec), 0)
+}
+
+cat("=== Naive Bayes (Bag-of-Words) ===\n")
+cat("Accuracy:", sprintf("%.1f%%", mean(cv_results_nb$accuracy) * 100),
+    "+/-", sprintf("%.1f%%", sd(cv_results_nb$accuracy) * 100), "\n")
+cat("F1 (critical):", sprintf("%.3f", mean(cv_results_nb$f1)),
+    "+/-", sprintf("%.3f", sd(cv_results_nb$f1)), "\n")
+cat("Precision:", sprintf("%.3f", mean(cv_results_nb$precision)), "\n")
+cat("Recall:", sprintf("%.3f", mean(cv_results_nb$recall)), "\n")
+```
+
+## Fold-level accuracy
+
+```{r}
+ggplot(cv_results_nb, aes(x = factor(fold), y = accuracy)) +
+  geom_col(fill = "#95A5A6", width = 0.6) +
+  geom_hline(yintercept = mean(cv_results_nb$accuracy),
+             linetype = "dashed", color = "#E74C3C") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(title = "Naive Bayes: Accuracy by Fold",
+       x = "Fold", y = "Accuracy") +
+  theme_minimal()
+```
+
+# Methods 2-5: BERT Embeddings + Classifiers
+
+Using HyeBERT (Armenian BERT) to get 768-dim [CLS] embeddings as document representations, then training classifiers on top.
+
+## Generate BERT embeddings
+
+```{python}
+import os, warnings
+import numpy as np
+import pandas as pd
+import torch
+from transformers import AutoTokenizer, AutoModel
+
+warnings.filterwarnings("ignore")
+
+model_name = "aking11/hyebert"
+print(f"Loading model: {model_name}")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+bert_model = AutoModel.from_pretrained(model_name)
+bert_model.eval()
+
+def get_embedding(text, tokenizer, model, max_length=512):
+    """Extract [CLS] token embedding from BERT."""
+    inputs = tokenizer(str(text), return_tensors="pt",
+                       truncation=True, max_length=max_length, padding=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return outputs.last_hidden_state[:, 0, :].cpu().numpy().flatten()
+
+def embed_series(texts, tokenizer, model, step=50):
+    """Embed all documents, printing progress."""
+    vecs = []
+    for i, t in enumerate(texts, start=1):
+        if i == 1 or i % step == 0 or i == len(texts):
+            print(f"  Embedding {i}/{len(texts)}")
+        vecs.append(get_embedding(t, tokenizer, model))
+    return np.array(vecs)
+
+train_df = r.train_df
+X = embed_series(train_df["text"], tokenizer, bert_model)
+y = train_df["label"].astype(int).values
+
+print(f"\nEmbedding matrix: {X.shape[0]} docs x {X.shape[1]} dimensions")
+```
+
+## Train and evaluate classifiers
+
+Training four classifiers on frozen BERT embeddings using the same 5-fold CV. Not using class_weight="balanced" since training data is already roughly balanced.
+
+```{python}
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_val_predict
+from sklearn.metrics import classification_report, confusion_matrix
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+lr = LogisticRegression(max_iter=2000, random_state=42)
+
+rf = RandomForestClassifier(n_estimators=500, min_samples_leaf=3,
+                            random_state=42, n_jobs=-1)
+
+gb = GradientBoostingClassifier(n_estimators=300, max_depth=4, learning_rate=0.05,
+                                subsample=0.8, random_state=42)
+
+results = {}
+for name, model in [("Logistic Regression", lr),
+                     ("Random Forest", rf),
+                     ("Gradient Boosting", gb)]:
+    acc = cross_val_score(model, X, y, cv=cv, scoring="accuracy")
+    f1 = cross_val_score(model, X, y, cv=cv, scoring="f1")
+    prec = cross_val_score(model, X, y, cv=cv, scoring="precision")
+    rec = cross_val_score(model, X, y, cv=cv, scoring="recall")
+    pred = cross_val_predict(model, X, y, cv=cv)
+    results[name] = {"acc": acc, "f1": f1, "prec": prec, "rec": rec, "pred": pred}
+    print(f"{name}:")
+    print(f"  Accuracy  = {acc.mean():.3f} +/- {acc.std():.3f}")
+    print(f"  F1        = {f1.mean():.3f} +/- {f1.std():.3f}")
+    print(f"  Precision = {prec.mean():.3f}")
+    print(f"  Recall    = {rec.mean():.3f}\n")
+
+# Stacking: cross-validated probabilities from each base model -> meta-learner
+lr_p = cross_val_predict(lr, X, y, cv=cv, method="predict_proba")[:, 1]
+rf_p = cross_val_predict(rf, X, y, cv=cv, method="predict_proba")[:, 1]
+gb_p = cross_val_predict(gb, X, y, cv=cv, method="predict_proba")[:, 1]
+
+X_stack = np.column_stack([lr_p, rf_p, gb_p])
+
+meta = LogisticRegressionCV(cv=5, random_state=42, max_iter=2000)
+stack_acc = cross_val_score(meta, X_stack, y, cv=cv, scoring="accuracy")
+stack_f1 = cross_val_score(meta, X_stack, y, cv=cv, scoring="f1")
+stack_prec = cross_val_score(meta, X_stack, y, cv=cv, scoring="precision")
+stack_rec = cross_val_score(meta, X_stack, y, cv=cv, scoring="recall")
+stack_pred = cross_val_predict(meta, X_stack, y, cv=cv)
+results["Stacking Ensemble"] = {"acc": stack_acc, "f1": stack_f1,
+                                  "prec": stack_prec, "rec": stack_rec,
+                                  "pred": stack_pred}
+
+print(f"Stacking Ensemble:")
+print(f"  Accuracy  = {stack_acc.mean():.3f} +/- {stack_acc.std():.3f}")
+print(f"  F1        = {stack_f1.mean():.3f} +/- {stack_f1.std():.3f}")
+print(f"  Precision = {stack_prec.mean():.3f}")
+print(f"  Recall    = {stack_rec.mean():.3f}")
+```
+
+## Summary table
+
+```{python}
+# comparing all five methods
+nb_acc = float(r.cv_results_nb['accuracy'].mean())
+nb_f1 = float(r.cv_results_nb['f1'].mean())
+nb_prec = float(r.cv_results_nb['precision'].mean())
+nb_rec = float(r.cv_results_nb['recall'].mean())
+nb_acc_sd = float(r.cv_results_nb['accuracy'].std())
+
+rows = []
+rows.append(("Naive Bayes", "Bag-of-words", nb_acc, nb_acc_sd, nb_f1, nb_prec, nb_rec))
+for name in ["Logistic Regression", "Random Forest", "Gradient Boosting", "Stacking Ensemble"]:
+    r_dict = results[name]
+    rows.append((name, "BERT", r_dict['acc'].mean(), r_dict['acc'].std(),
+                 r_dict['f1'].mean(), r_dict['prec'].mean(), r_dict['rec'].mean()))
+
+print(f"\n{'Method':<22} {'Repr.':<8} {'Acc':>7} {'SD':>6} {'F1':>6} {'Prec':>6} {'Rec':>6}")
+print("-" * 65)
+for row in rows:
+    print(f"{row[0]:<22} {row[1]:<8} {row[2]:>6.1%} {row[3]:>6.3f} {row[4]:>6.3f} {row[5]:>6.3f} {row[6]:>6.3f}")
+```
+
+## Fine-tuning vs. feature extraction
+
+Testing whether fine-tuning HyeBERT's last 2 transformer layers outperforms frozen embeddings.
+
+```{python}
+from transformers import AutoModelForSequenceClassification
+from torch.utils.data import Dataset as TorchDataset, DataLoader
+
+BATCH_SIZE = 8
+EPOCHS = 5
+FT_LR = 2e-5
+FREEZE_LAYERS = 10
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+class CSODataset(TorchDataset):
+    def __init__(self, texts, labels, tok, max_len=512):
+        self.enc = tok(texts, truncation=True, padding=True,
+                       max_length=max_len, return_tensors="pt")
+        self.labels = torch.tensor(labels, dtype=torch.long)
+    def __len__(self):
+        return len(self.labels)
+    def __getitem__(self, idx):
+        return {"input_ids": self.enc["input_ids"][idx],
+                "attention_mask": self.enc["attention_mask"][idx],
+                "labels": self.labels[idx]}
+
+texts_list = train_df["text"].astype(str).tolist()
+labels_arr = train_df["label"].astype(int).values
+
+ft_preds = np.zeros(len(labels_arr))
+fe_preds = np.zeros(len(labels_arr))
+
+for fold, (tr_idx, va_idx) in enumerate(cv.split(texts_list, labels_arr)):
+    print(f"Fold {fold+1}/5")
+    tr_texts = [texts_list[i] for i in tr_idx]
+    va_texts = [texts_list[i] for i in va_idx]
+    tr_labels = labels_arr[tr_idx]
+    va_labels = labels_arr[va_idx]
+
+    # fine-tuned model
+    ft_model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=2)
+    for pname, param in ft_model.named_parameters():
+        if "encoder.layer" in pname:
+            layer_num = int(pname.split("encoder.layer.")[1].split(".")[0])
+            if layer_num < FREEZE_LAYERS:
+                param.requires_grad = False
+        elif "embeddings" in pname:
+            param.requires_grad = False
+    ft_model.to(device)
+
+    tr_loader = DataLoader(CSODataset(tr_texts, tr_labels, tokenizer),
+                           batch_size=BATCH_SIZE, shuffle=True)
+    va_loader = DataLoader(CSODataset(va_texts, va_labels, tokenizer),
+                           batch_size=BATCH_SIZE)
+    opt = torch.optim.AdamW(
+        [p for p in ft_model.parameters() if p.requires_grad],
+        lr=FT_LR, weight_decay=0.01)
+
+    for epoch in range(EPOCHS):
+        ft_model.train()
+        for batch in tr_loader:
+            opt.zero_grad()
+            out = ft_model(input_ids=batch["input_ids"].to(device),
+                           attention_mask=batch["attention_mask"].to(device),
+                           labels=batch["labels"].to(device))
+            out.loss.backward()
+            torch.nn.utils.clip_grad_norm_(ft_model.parameters(), 1.0)
+            opt.step()
+
+    ft_model.eval()
+    fold_p = []
+    with torch.no_grad():
+        for batch in va_loader:
+            out = ft_model(input_ids=batch["input_ids"].to(device),
+                           attention_mask=batch["attention_mask"].to(device))
+            fold_p.extend(torch.argmax(out.logits, dim=-1).cpu().numpy())
+    ft_preds[va_idx] = fold_p
+
+    # frozen embeddings baseline
+    from sklearn.linear_model import LogisticRegression as LR_
+    lr_bl = LR_(max_iter=2000, random_state=42)
+    lr_bl.fit(X[tr_idx], tr_labels)
+    fe_preds[va_idx] = lr_bl.predict(X[va_idx])
+
+    del ft_model
+    if device.type == "mps":
+        torch.mps.empty_cache()
+
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+print(f"\n{'Method':<25} {'Acc':>7} {'F1':>6} {'Prec':>6} {'Rec':>6}")
+print("-" * 55)
+for lbl, p in [("Fine-tuned HyeBERT", ft_preds),
+               ("Frozen + LogReg", fe_preds)]:
+    print(f"{lbl:<25} {accuracy_score(labels_arr, p):>6.1%} "
+          f"{f1_score(labels_arr, p):>6.3f} "
+          f"{precision_score(labels_arr, p):>6.3f} "
+          f"{recall_score(labels_arr, p):>6.3f}")
+
+delta_acc = (accuracy_score(labels_arr, ft_preds) -
+             accuracy_score(labels_arr, fe_preds)) * 100
+delta_f1  = (f1_score(labels_arr, ft_preds) -
+             f1_score(labels_arr, fe_preds)) * 100
+print(f"\nDelta: Accuracy {delta_acc:+.1f}pp, F1 {delta_f1:+.1f}pp")
+```
+
+## Performance comparison
+
+```{r}
+perf_df <- tibble(
+  method = c("Naive Bayes", "Logistic Reg.", "Random Forest",
+             "Gradient Boost.", "Stacking Ens."),
+  representation = c("Bag-of-words", rep("BERT", 4)),
+  accuracy = c(
+    mean(cv_results_nb$accuracy),
+    mean(py$results[["Logistic Regression"]][["acc"]]),
+    mean(py$results[["Random Forest"]][["acc"]]),
+    mean(py$results[["Gradient Boosting"]][["acc"]]),
+    mean(py$results[["Stacking Ensemble"]][["acc"]])
+  ),
+  sd = c(
+    sd(cv_results_nb$accuracy),
+    sd(py$results[["Logistic Regression"]][["acc"]]),
+    sd(py$results[["Random Forest"]][["acc"]]),
+    sd(py$results[["Gradient Boosting"]][["acc"]]),
+    sd(py$results[["Stacking Ensemble"]][["acc"]])
+  )
+)
+
+perf_df$method <- factor(perf_df$method, levels = perf_df$method)
+
+ggplot(perf_df, aes(x = method, y = accuracy, fill = representation)) +
+  geom_col(width = 0.65) +
+  geom_errorbar(aes(ymin = accuracy - sd, ymax = accuracy + sd), width = 0.2) +
+  geom_vline(xintercept = 1.5, linetype = "dashed", color = "gray40") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_fill_manual(values = c("Bag-of-words" = "#95A5A6", "BERT" = "#2C3E50")) +
+  labs(
+    title = "Classification Accuracy Across Methods",
+    subtitle = "Error bars show +/- 1 SD across 5 CV folds",
+    x = NULL, y = "Accuracy", fill = "Representation"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+## Model agreement
+
+```{python}
+# checking how often BERT-based classifiers agree with each other
+pred_df = pd.DataFrame({
+    "LR": results["Logistic Regression"]["pred"],
+    "RF": results["Random Forest"]["pred"],
+    "GB": results["Gradient Boosting"]["pred"],
+    "Stack": results["Stacking Ensemble"]["pred"]
+})
+
+pairs = [("LR","RF"), ("LR","GB"), ("RF","GB")]
+print("Pairwise agreement:\n")
+for a, b in pairs:
+    print(f"  {a} vs {b}: {(pred_df[a] == pred_df[b]).mean():.1%}")
+
+all_agree = (pred_df["LR"] == pred_df["RF"]) & (pred_df["RF"] == pred_df["GB"])
+print(f"\nAll three agree: {all_agree.mean():.1%} of documents")
+```
+
+```{r}
+agree_rate <- mean(py$all_agree)
+agree_df <- tibble(
+  status = c("All agree", "Disagree"),
+  pct = c(agree_rate, 1 - agree_rate)
+)
+
+ggplot(agree_df, aes(x = "", y = pct, fill = status)) +
+  geom_col(width = 0.4) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("All agree" = "#27AE60", "Disagree" = "#E74C3C")) +
+  labs(title = "Model Agreement Rate", x = NULL, y = NULL, fill = NULL) +
+  theme_minimal()
+```
+
+# Full Corpus Classification
+
+## Load full corpus
+
+```{r}
+uic <- read_csv("data/uic_publications.csv", show_col_types = FALSE)
+hcav <- read_csv("data/hcav_publications.csv", show_col_types = FALSE)
+hahr <- read_csv("data/hahr_publications.csv", show_col_types = FALSE)
+csi <- read_csv("data/csi_publications.csv", show_col_types = FALSE)
+ti <- read_csv("data/ti_armenia_publications.csv", show_col_types = FALSE)
+
+harmonize <- function(df, org_name) {
+  df %>%
+    mutate(Organization = org_name,
+           full_text = paste(title, content, sep = " ")) %>%
+    filter(!is.na(content), nchar(content) > 100) %>%
+    select(Organization, title, date, full_text)
+}
+
+full_corpus <- bind_rows(
+  harmonize(uic, "UIC"),
+  harmonize(hcav, "HCAV"),
+  harmonize(hahr, "HAHR"),
+  harmonize(csi, "CSI"),
+  harmonize(ti, "TI_ARMENIA")
+)
+
+cat("Full corpus:", nrow(full_corpus), "documents\n\n")
+full_corpus %>%
+  group_by(Organization) %>%
+  summarise(n = n()) %>%
+  kable(caption = "Documents by organization in full corpus")
+```
+
+## Classify with Random Forest
+
+Using RF since it had the highest accuracy in cross-validation.
+
+```{python}
+rf_final = RandomForestClassifier(n_estimators=500, min_samples_leaf=3,
+                                   random_state=42, n_jobs=-1)
+rf_final.fit(X, y)
+
+full_df = r.full_corpus
+print(f"Embedding full corpus: {len(full_df)} documents...")
+X_full = embed_series(full_df["full_text"], tokenizer, bert_model, step=500)
+
+full_preds = rf_final.predict(X_full)
+full_probs = rf_final.predict_proba(X_full)
+
+full_df["predicted_class"] = ["critical" if p == 1 else "non_critical" for p in full_preds]
+full_df["prob_critical"] = full_probs[:, 1]
+
+print(f"\nPredicted critical: {sum(full_preds)} ({sum(full_preds)/len(full_preds):.1%})")
+print(f"Predicted non-critical: {sum(full_preds==0)} ({sum(full_preds==0)/len(full_preds):.1%})")
+```
+
+## Criticality trajectories
+
+```{r}
+classified <- py$full_df %>%
+  mutate(year = lubridate::year(as.Date(date)))
+
+cso_year_panel <- classified %>%
+  filter(!is.na(year), year >= 2014, year <= 2024) %>%
+  group_by(Organization, year) %>%
+  summarise(
+    n_docs = n(),
+    n_critical = sum(predicted_class == "critical"),
+    critical_share = mean(predicted_class == "critical"),
+    .groups = "drop"
+  )
+
+ggplot(cso_year_panel, aes(x = year, y = critical_share,
+                            color = Organization, group = Organization)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2018, linetype = "dashed", color = "gray50") +
+  annotate("text", x = 2018.2, y = 0.05, label = "Velvet Revolution",
+           hjust = 0, size = 3, color = "gray40") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_continuous(breaks = 2014:2024) +
+  labs(
+    title = "Figure 6. Predicted Criticality by CSO-Year",
+    x = "Year", y = "Critical Share"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+write_csv(cso_year_panel, "data/cso_year_panel_2014_2024.csv")
+```
+
+## Document volume
+
+```{r}
+ggplot(cso_year_panel, aes(x = year, y = n_docs, fill = Organization)) +
+  geom_col() +
+  facet_wrap(~Organization, scales = "free_y", ncol = 1) +
+  scale_x_continuous(breaks = 2014:2024) +
+  labs(
+    title = "Document Volume by CSO-Year",
+    x = "Year", y = "Number of documents"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Sensitivity Analysis
+
+Checking whether different classifiers produce different substantive conclusions.
+
+```{python}
+lr_final = LogisticRegression(max_iter=2000, random_state=42)
+gb_final = GradientBoostingClassifier(n_estimators=300, max_depth=4, learning_rate=0.05,
+                                       subsample=0.8, random_state=42)
+lr_final.fit(X, y)
+gb_final.fit(X, y)
+
+lr_preds = lr_final.predict(X_full)
+gb_preds = gb_final.predict(X_full)
+rf_preds = full_preds
+
+full_df["pred_lr"] = lr_preds
+full_df["pred_rf"] = rf_preds
+full_df["pred_gb"] = gb_preds
+
+agree_all = ((lr_preds == rf_preds) & (rf_preds == gb_preds)).mean()
+print(f"All three classifiers agree on {agree_all:.1%} of full corpus documents")
+```
+
+```{r}
+sensitivity_df <- py$full_df %>%
+  mutate(year = lubridate::year(as.Date(date))) %>%
+  filter(!is.na(year), year >= 2014, year <= 2024) %>%
+  group_by(Organization, year) %>%
+  summarise(
+    LR = mean(pred_lr == 1),
+    RF = mean(pred_rf == 1),
+    GB = mean(pred_gb == 1),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c(LR, RF, GB),
+               names_to = "Classifier",
+               values_to = "critical_share")
+
+ggplot(sensitivity_df, aes(x = year, y = critical_share,
+                            color = Classifier, linetype = Classifier)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.5) +
+  facet_wrap(~Organization) +
+  geom_vline(xintercept = 2018, linetype = "dashed", color = "gray70", linewidth = 0.3) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = seq(2014, 2024, 2)) +
+  labs(
+    title = "Sensitivity Analysis: Criticality Trajectories by Classifier",
+    x = "Year", y = "Share of critical publications"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Document-Level Logistic Regression
+
+Estimating a document-level logit with organization fixed effects and cluster-robust SEs to formally test whether criticism changed after 2018.
+
+```{python}
+import statsmodels.formula.api as smf
+from statsmodels.stats.sandwich_covariance import cov_cluster
+from scipy import stats as sp_stats
+
+doc_df = full_df.copy()
+doc_df['critical_bin'] = (doc_df['predicted_class'] == 'critical').astype(int)
+doc_df['year_num'] = pd.to_datetime(doc_df['date']).dt.year
+doc_df = doc_df[(doc_df['year_num'] >= 2014) & (doc_df['year_num'] <= 2024)].copy()
+doc_df['post_2018'] = (doc_df['year_num'] >= 2019).astype(int)
+doc_df['org_year'] = doc_df['Organization'] + '_' + doc_df['year_num'].astype(str)
+
+print(f"Documents: {len(doc_df)}")
+print(f"Pre-2018 criticality: {doc_df[doc_df['post_2018']==0]['critical_bin'].mean():.1%}")
+print(f"Post-2018 criticality: {doc_df[doc_df['post_2018']==1]['critical_bin'].mean():.1%}")
+
+model1 = smf.logit('critical_bin ~ post_2018 + C(Organization)', data=doc_df).fit(disp=0)
+
+clust_cov = cov_cluster(model1, doc_df['org_year'])
+clust_se = np.sqrt(np.diag(clust_cov))
+z_vals = model1.params / clust_se
+p_vals = 2 * (1 - sp_stats.norm.cdf(np.abs(z_vals)))
+
+print("\n--- Logit with Org Fixed Effects ---")
+print(f"{'Variable':<35} {'Coef':>8} {'SE(cl)':>8} {'z':>7} {'p':>7}")
+print("-" * 70)
+for name, coef, se, z, p in zip(model1.params.index, model1.params, clust_se, z_vals, p_vals):
+    sig = '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else ''
+    print(f"{name:<35} {coef:>8.4f} {se:>8.4f} {z:>7.2f} {p:>7.4f} {sig}")
+
+# average marginal effect
+p_hat = model1.predict(doc_df)
+beta = model1.params['post_2018']
+ame = (p_hat * (1 - p_hat) * beta).mean()
+print(f"\nAverage Marginal Effect of Post-2018: {ame:.4f}")
+print(f"Interpretation: {abs(ame)*100:.1f} pp {'decrease' if ame < 0 else 'increase'} "
+      f"in probability of critical content (p = {p_vals[list(model1.params.index).index('post_2018')]:.3f})")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
